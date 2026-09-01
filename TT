@@ -1,0 +1,1226 @@
+## ============================================================
+## CARRION ARRIVAL COMMUNITY
+## FULL-DAY FACTORIAL ANALYSIS
+##
+## Directory structure:
+#
+# BData/
+# ├── Closed/
+# │   ├── Lynx/
+# │   │   ├── sitio1.csv
+# │   │   └── sitio2.csv
+# │   └── NoLynx/
+# │       ├── sitio3.csv
+# │       └── sitio4.csv
+# └── Open/
+#     ├── Lynx/
+#     │   ├── sitio5.csv
+#     │   └── sitio6.csv
+#     └── NoLynx/
+#         ├── sitio7.csv
+#         └── sitio8.csv
+#
+## Only CSV files whose basename begins exactly with "summary"
+## are included.
+##
+## Main analyses:
+## 1. Five-minute temporal bins
+## 2. Maximum count per species and temporal bin
+## 3. Arrival events defined as absence-to-presence transitions
+## 4. Relative arrival composition by file
+## 5. Bray-Curtis dissimilarity
+## 6. PCoA with Lingoes correction
+## 7. NMDS
+## 8. Factorial PERMANOVA
+## 9. Multivariate dispersion
+## ============================================================
+setwd("C:/Users/Jose_/OneDrive/03 ProyectoCLM/Analisis seleccionados")
+library(tidyverse)
+library(lubridate)
+library(janitor)
+library(vegan)
+## ============================================================
+## PARAMETERS
+## ============================================================
+data_directory <- "BData"
+sep_char <- ";"
+tz_local <- "Europe/Madrid"
+bin_min <- 5L
+n_permutations <- 9999L
+species_raw <- c("N","L","A","I","U","C","Z","M","J","G","K","O","R","T")
+community <- janitor::make_clean_names(species_raw)
+stopifnot(length(species_raw) == length(community),!anyDuplicated(community))
+maximum_failed_datetime_fraction <- 0.01
+maximum_failed_datetime_examples <- 20L
+## Set to TRUE only if month-day-year dates are known to occur
+allow_month_first_dates <- FALSE
+## ============================================================
+## CHECK DATA DIRECTORY
+## ============================================================
+if (!dir.exists(data_directory)) {
+stop(paste("Data directory not found:",data_directory))
+}
+## ============================================================
+## FIND ALL CSV FILES
+## ============================================================
+all_csv_files <- list.files(path = data_directory,pattern = "\\.csv$",recursive = TRUE,full.names = TRUE,ignore.case = TRUE)
+if (length(all_csv_files) == 0L) {
+stop(paste("No CSV files were found in",data_directory))
+}
+all_csv_files <- normalizePath(all_csv_files,winslash = "/",mustWork = TRUE)
+## ============================================================
+## SELECT ONLY FILES BEGINNING EXACTLY WITH "summary"
+## ============================================================
+eligible <- startsWith(basename(all_csv_files),"summary")
+csv_files <- all_csv_files[eligible]
+excluded_csv_files <- all_csv_files[!eligible]
+if (length(csv_files) == 0L) {
+stop(paste("No CSV files whose basename begins exactly with","'summary' were found in",data_directory))
+}
+## Final strict validation
+stopifnot(all(startsWith(basename(csv_files),"summary")))
+cat("\nNumber of CSV files found:",length(all_csv_files),"\n")
+cat("Number of eligible summary files:",length(csv_files),"\n")
+cat("\nFiles selected for analysis:\n")
+print(csv_files)
+cat("\nCSV files excluded from analysis:\n")
+if (length(excluded_csv_files) == 0L) {
+cat("None\n")
+} else {
+print(excluded_csv_files)
+}
+## ============================================================
+## BUILD METADATA FROM DIRECTORY STRUCTURE
+## ============================================================
+site_metadata <- tibble(file_path = csv_files
+) |>
+mutate(file = basename(file_path),lynx_folder = basename(dirname(file_path)),environment_folder = basename(dirname(dirname(file_path))),
+environment = case_when(environment_folder == "Closed" ~ "Closed",environment_folder == "Open" ~ "Open",TRUE ~ NA_character_),
+lynx = case_when(lynx_folder == "Lynx" ~ "Lynx",lynx_folder == "NoLynx" ~ "NoLynx",TRUE ~ NA_character_),
+site_base = tools::file_path_sans_ext(file),preliminary_site = paste(environment,lynx,site_base,sep = "_"),
+site = make.unique(preliminary_site),environment = factor(environment,levels = c("Closed","Open")),lynx = factor(lynx,levels = c(
+"NoLynx","Lynx"))
+) |>
+arrange(environment,lynx,site
+) |>
+select(file_path,file,site,environment,lynx)
+## ============================================================
+## VALIDATE METADATA
+## ============================================================
+if (any(is.na(site_metadata$environment))) {
+stop(paste("Files outside the expected Closed/Open structure:",paste(site_metadata$file_path[is.na(site_metadata$environment)],
+collapse = ", ")))
+}
+if (any(is.na(site_metadata$lynx))) {
+stop(paste("Files outside the expected Lynx/NoLynx structure:",paste(site_metadata$file_path[is.na(site_metadata$lynx)],collapse = ", ")))
+}
+if (anyDuplicated(site_metadata$site)) {
+stop("Duplicated site identifiers remained after metadata construction")
+}
+if (!all(startsWith(site_metadata$file,"summary")
+)) {
+stop("At least one selected file does not begin exactly with 'summary'")
+}
+cat("\nSelected site metadata:\n")
+print(site_metadata,n = Inf)
+## ============================================================
+## DESIGN TABLE
+## ============================================================
+design_table <- site_metadata |>
+count(environment,lynx,name = "number_of_sites",.drop = FALSE)
+cat("\nNumber of selected files per treatment combination:\n")
+print(design_table)
+if (any(design_table$number_of_sites == 0L)) {
+stop(paste("At least one environment-by-lynx combination","contains no eligible summary files"))
+}
+if (any(design_table$number_of_sites < 2L)) {
+warning(paste("At least one environment-by-lynx combination","contains fewer than two eligible summary files"))
+}
+## ============================================================
+## CHECK FILE HEADERS
+## ============================================================
+header_check <- map_dfr(site_metadata$file_path,
+function(path) {
+current_names <- read.csv(path,sep = sep_char,stringsAsFactors = FALSE,check.names = FALSE,nrows = 1L
+) |>
+clean_names() |>
+names()
+tibble(file_path = path,datetime_present = "datetime" %in% current_names,missing_species = paste(setdiff(community,current_names),
+collapse = ", "),extra_columns = paste(setdiff(current_names,c("filename","datetime",community,"total","site","date")),
+collapse = ", "))
+}
+)
+cat("\nHeader diagnostic:\n")
+print(header_check,n = Inf)
+if (any(!header_check$datetime_present)) {
+stop(paste("The datetime column is missing in:",paste(header_check$file_path[!header_check$datetime_present],collapse = ", ")))
+}
+## ============================================================
+## STRICT RECORD-LEVEL MULTI-FORMAT DATETIME PARSER
+##
+## Exact formats are used to prevent flexible parsing from
+## changing the year or confusing minutes with seconds.
+## ============================================================
+parse_datetime_multiformat <- function(x,tz,allow_month_first = FALSE
+) {
+raw_value <- as.character(x)
+clean_value <- trimws(raw_value)
+clean_value[toupper(clean_value) %in% c("","NA","N/A","NULL","NAN","NONE","-")] <- NA_character_
+clean_value <- stringr::str_replace_all(clean_value,"\u00A0"," ")
+clean_value <- stringr::str_squish(clean_value)
+clean_value <- stringr::str_replace(clean_value,"^['\"]+","")
+clean_value <- stringr::str_replace(clean_value,"['\"]+$","")
+  ## ----------------------------------------------------------
+  ## Insert missing separator between date and time
+  ##
+  ## Example:
+  ## 2025-10-0822:49:00
+  ## becomes:
+  ## 2025-10-08 22:49:00
+  ## ----------------------------------------------------------
+clean_value <- stringr::str_replace(clean_value,pattern = paste0("^(\\d{4}[-/.]\\d{1,2}[-/.]\\d{1,2})","(\\d{1,2}:\\d{2}(?::\\d{2})?)$"),
+replacement = "\\1 \\2")
+datetime <- rep(as.POSIXct(NA,tz = tz),length(clean_value))
+parser_used <- rep(NA_character_,length(clean_value))
+  ## ----------------------------------------------------------
+  ## Helper for exact parsing
+  ## ----------------------------------------------------------
+parse_exact_subset <- function(pattern,format_string,parser_name
+) {
+indices <- which(!is.na(clean_value) & is.na(datetime) & stringr::str_detect(clean_value,pattern))
+if (length(indices) == 0L) {
+return(invisible(NULL))
+}
+parsed_values <- suppressWarnings(as.POSIXct(strptime(clean_value[indices],format = format_string,tz = tz)))
+successful <- !is.na(parsed_values)
+if (any(successful)) {
+resolved_indices <- indices[successful]
+datetime[resolved_indices] <<-
+parsed_values[successful]
+parser_used[resolved_indices] <<-
+parser_name
+}
+invisible(NULL)
+}
+  ## ----------------------------------------------------------
+  ## Normalize ISO T separator and terminal Z
+  ## ----------------------------------------------------------
+iso_t_indices <- which(!is.na(clean_value) & stringr::str_detect(clean_value,"^\\d{4}[-/.]\\d{1,2}[-/.]\\d{1,2}T"))
+if (length(iso_t_indices) > 0L) {
+clean_value[iso_t_indices] <-
+clean_value[iso_t_indices] |>
+stringr::str_replace("T"," "
+) |>
+stringr::str_replace("Z$","")
+}
+  ## ----------------------------------------------------------
+  ## Year-month-day with seconds
+  ##
+  ## Example: 2024-11-12 01:58:23
+  ## ----------------------------------------------------------
+parse_exact_subset(pattern = paste0("^\\d{4}-\\d{1,2}-\\d{1,2} ","\\d{1,2}:\\d{2}:\\d{2}$"),format_string = "%Y-%m-%d %H:%M:%S",
+parser_name = "ymd_hms")
+  ## ----------------------------------------------------------
+  ## Year-month-day without seconds
+  ##
+  ## Example: 2024-11-12 01:58
+  ## ----------------------------------------------------------
+parse_exact_subset(pattern = paste0("^\\d{4}-\\d{1,2}-\\d{1,2} ","\\d{1,2}:\\d{2}$"),format_string = "%Y-%m-%d %H:%M",parser_name = "ymd_hm")
+  ## ----------------------------------------------------------
+  ## Year-month-day without time
+  ## ----------------------------------------------------------
+parse_exact_subset(pattern = "^\\d{4}-\\d{1,2}-\\d{1,2}$",format_string = "%Y-%m-%d",parser_name = "ymd")
+  ## ----------------------------------------------------------
+  ## Year/month/day with seconds
+  ## ----------------------------------------------------------
+parse_exact_subset(pattern = paste0("^\\d{4}/\\d{1,2}/\\d{1,2} ","\\d{1,2}:\\d{2}:\\d{2}$"),format_string = "%Y/%m/%d %H:%M:%S",
+parser_name = "ymd_slash_hms")
+  ## ----------------------------------------------------------
+  ## Year/month/day without seconds
+  ## ----------------------------------------------------------
+parse_exact_subset(pattern = paste0("^\\d{4}/\\d{1,2}/\\d{1,2} ","\\d{1,2}:\\d{2}$"),format_string = "%Y/%m/%d %H:%M",
+parser_name = "ymd_slash_hm")
+  ## ----------------------------------------------------------
+  ## Day/month/year with seconds
+  ##
+  ## Example: 21/11/2024 00:10:23
+  ## ----------------------------------------------------------
+parse_exact_subset(pattern = paste0("^\\d{1,2}/\\d{1,2}/\\d{4} ","\\d{1,2}:\\d{2}:\\d{2}$"),format_string = "%d/%m/%Y %H:%M:%S",
+parser_name = "dmy_hms")
+  ## ----------------------------------------------------------
+  ## Day/month/year without seconds
+  ##
+  ## Example: 21/11/2024 0:04
+  ## ----------------------------------------------------------
+parse_exact_subset(pattern = paste0("^\\d{1,2}/\\d{1,2}/\\d{4} ","\\d{1,2}:\\d{2}$"),format_string = "%d/%m/%Y %H:%M",parser_name = "dmy_hm")
+  ## ----------------------------------------------------------
+  ## Day/month/year without time
+  ## ----------------------------------------------------------
+parse_exact_subset(pattern = "^\\d{1,2}/\\d{1,2}/\\d{4}$",format_string = "%d/%m/%Y",parser_name = "dmy")
+  ## ----------------------------------------------------------
+  ## Day-month-year with seconds
+  ## ----------------------------------------------------------
+parse_exact_subset(pattern = paste0("^\\d{1,2}-\\d{1,2}-\\d{4} ","\\d{1,2}:\\d{2}:\\d{2}$"),format_string = "%d-%m-%Y %H:%M:%S",
+parser_name = "dmy_dash_hms")
+  ## ----------------------------------------------------------
+  ## Day-month-year without seconds
+  ## ----------------------------------------------------------
+parse_exact_subset(pattern = paste0("^\\d{1,2}-\\d{1,2}-\\d{4} ","\\d{1,2}:\\d{2}$"),format_string = "%d-%m-%Y %H:%M",
+parser_name = "dmy_dash_hm")
+  ## ----------------------------------------------------------
+  ## Optional month-first formats
+  ## ----------------------------------------------------------
+if (allow_month_first) {
+parse_exact_subset(pattern = paste0("^\\d{1,2}/\\d{1,2}/\\d{4} ","\\d{1,2}:\\d{2}:\\d{2}$"),format_string = "%m/%d/%Y %H:%M:%S",
+parser_name = "mdy_hms")
+parse_exact_subset(pattern = paste0("^\\d{1,2}/\\d{1,2}/\\d{4} ","\\d{1,2}:\\d{2}$"),format_string = "%m/%d/%Y %H:%M",parser_name = "mdy_hm"
+)
+}
+  ## ----------------------------------------------------------
+  ## Text-month fallback
+  ## ----------------------------------------------------------
+text_month_indices <- which(!is.na(clean_value) & is.na(datetime) & stringr::str_detect(clean_value,"[A-Za-z]"))
+if (length(text_month_indices) > 0L) {
+parsed_values <- suppressWarnings(lubridate::parse_date_time(clean_value[text_month_indices],orders = c("dbY HMS","dbY HM","dbY"),tz = tz,
+exact = TRUE,quiet = TRUE))
+successful <- !is.na(parsed_values)
+if (any(successful)) {
+resolved_indices <- text_month_indices[successful]
+datetime[resolved_indices] <-
+parsed_values[successful]
+parser_used[resolved_indices] <-
+"text_month"
+}
+}
+  ## ----------------------------------------------------------
+  ## Final classification
+  ## ----------------------------------------------------------
+parser_used[is.na(clean_value)] <- "missing_input"
+parser_used[!is.na(clean_value) & is.na(datetime)] <- "failed"
+result <- tibble(datetime_original = raw_value,datetime_clean = clean_value,datetime = datetime,datetime_parser = parser_used,
+datetime_failed = (!is.na(clean_value) & is.na(datetime)))
+return(result)
+}
+## ============================================================
+## PROCESS ONE SUMMARY FILE
+## ============================================================
+process_summary <- function(csv_path,site_id,community_columns) {
+  ## ----------------------------------------------------------
+  ## Verify eligible filename
+  ## ----------------------------------------------------------
+  if (!startsWith(basename(csv_path),"summary")) {
+  stop(paste("Ineligible file passed to process_summary:",csv_path))
+  }
+  ## ----------------------------------------------------------
+  ## Read data
+  ## ----------------------------------------------------------
+  df_raw <- read.csv(csv_path,sep = sep_char,stringsAsFactors = FALSE,check.names = FALSE
+  ) |>
+  clean_names()
+  if (!"datetime" %in% names(df_raw)) {
+  stop(paste("The datetime column is missing in",csv_path))
+  }
+  total_rows <- nrow(df_raw)
+  if (total_rows == 0L) {
+  stop(paste("The input file contains no rows:",csv_path))
+  }
+  ## ----------------------------------------------------------
+  ## Add missing species columns
+  ## ----------------------------------------------------------
+  missing_species <- setdiff(community_columns,names(df_raw))
+  if (length(missing_species) > 0L) {
+    message(paste("Site:",site_id,"| species columns filled with zero:",paste(missing_species,collapse = ", ")))
+    for (sp in missing_species) {
+      df_raw[[sp]] <- 0
+   }
+  }
+  ## ----------------------------------------------------------
+  ## Keep columns in a consistent order
+  ## ----------------------------------------------------------
+  df_raw <- df_raw |>
+  select(datetime,all_of(community_columns),everything())
+  ## ----------------------------------------------------------
+  ## Parse datetime
+  ## ----------------------------------------------------------
+  datetime_result <- parse_datetime_multiformat(x = df_raw$datetime,tz = tz_local,allow_month_first = allow_month_first_dates)
+  required_parser_columns <- c("datetime_original","datetime_clean","datetime","datetime_parser","datetime_failed")
+  if (nrow(datetime_result) != total_rows || !all(required_parser_columns %in% names(datetime_result))
+  ) {
+  stop(paste("Unexpected datetime parser output in",csv_path))
+  }
+  df_raw <- bind_cols(
+  df_raw |>
+  select(-datetime),datetime_result)
+  ## ----------------------------------------------------------
+  ## Datetime parsing diagnostics
+  ## ----------------------------------------------------------
+  failed_datetimes <- sum(df_raw$datetime_failed,na.rm = TRUE)
+  missing_datetime_inputs <- sum(df_raw$datetime_parser == "missing_input",na.rm = TRUE)
+  non_missing_datetime_inputs <- sum(df_raw$datetime_parser != "missing_input",na.rm = TRUE)
+  parsed_datetimes <- sum(!is.na(df_raw$datetime))
+  failed_datetime_fraction <- if (non_missing_datetime_inputs > 0L
+  ) {
+  failed_datetimes /
+  non_missing_datetime_inputs
+  } else {
+  NA_real_
+  }
+  ## ----------------------------------------------------------
+  ## Check datetime row classification
+  ## ----------------------------------------------------------
+  classified_rows <- (
+  parsed_datetimes +
+  failed_datetimes +
+  missing_datetime_inputs)
+  if (classified_rows != total_rows) {
+  stop(paste("Datetime row classification is inconsistent in",csv_path,"| total rows:",total_rows,"| classified rows:",classified_rows))
+  }
+  if (any(is.na(df_raw$datetime_parser))) {
+  stop(paste("Unclassified datetime records remained in",csv_path))
+  }
+  cat("\nSite:",site_id,"\n","File:",basename(csv_path),"\n","Total source rows:",total_rows,"\n",
+  "Missing datetime inputs:",missing_datetime_inputs,"\n","Successfully parsed datetimes:",parsed_datetimes,"\n",
+  "Failed non-missing datetimes:",failed_datetimes,"\n","Failed datetime percentage:",ifelse(is.finite(failed_datetime_fraction),round(
+  100 * failed_datetime_fraction,3),NA_real_),"%\n")
+  ## ----------------------------------------------------------
+  ## Parser frequency summary
+  ## ----------------------------------------------------------
+  parser_summary_current <- df_raw |>
+  count(datetime_parser,name = "number_of_rows"
+  ) |>
+  mutate(site = site_id,file = basename(csv_path),proportion = number_of_rows / sum(number_of_rows)
+  ) |>
+  select(site,file,datetime_parser,number_of_rows,proportion)
+  cat("\nDatetime parser summary:\n")
+  base::print.data.frame(as.data.frame(parser_summary_current),row.names = FALSE,na.print = "NA")
+  ## ----------------------------------------------------------
+  ## Extract unresolved datetime records
+  ## ----------------------------------------------------------
+  failed_datetime_rows <- df_raw |>
+  filter(datetime_failed)
+  if (failed_datetimes > 0L) {
+  failed_examples <- failed_datetime_rows |>
+  count(datetime_original,datetime_clean,sort = TRUE,name = "number_of_rows"
+  ) |>
+  slice_head(n = maximum_failed_datetime_examples)
+  cat("\nUnparsed datetime examples for",site_id,":\n")
+  base::print.data.frame(as.data.frame(failed_examples),row.names = FALSE,na.print = "NA")
+  warning(paste0("Datetime parsing failed for ",failed_datetimes," rows in ",basename(csv_path)," (",round(100 * failed_datetime_fraction,3
+  ),"% of non-missing datetime inputs)."))
+  }
+  ## ----------------------------------------------------------
+  ## Enforce parsing failure threshold
+  ## ----------------------------------------------------------
+  if (is.finite(failed_datetime_fraction) && failed_datetime_fraction > maximum_failed_datetime_fraction
+  ) {
+  stop(paste0("Datetime failure rate exceeded ",100 * maximum_failed_datetime_fraction,"% in ",basename(csv_path),
+  ". Inspect the unparsed datetime examples above."))
+  }
+  ## ----------------------------------------------------------
+  ## Remove rows without a valid datetime
+  ## ----------------------------------------------------------
+  df_raw <- df_raw |>
+  filter(!is.na(datetime))
+  valid_source_rows <- nrow(df_raw)
+  if (valid_source_rows == 0L) {
+  stop(paste("No valid datetime values remained in",csv_path))
+  }
+  ## ----------------------------------------------------------
+  ## Convert species columns to numeric
+  ## ----------------------------------------------------------
+  df_raw <- df_raw |>
+  mutate(across(all_of(community_columns),~suppressWarnings(as.numeric(as.character(.x)))))
+  species_na <- colSums(is.na(df_raw[,community_columns,drop = FALSE]))
+  if (any(species_na > 0L)) {
+  warning(paste("Missing or non-numeric species values replaced with zero in",basename(csv_path),":",paste(names(species_na)[species_na > 0L],
+  species_na[species_na > 0L],sep = "=",collapse = ", ")))
+  }
+  df_raw <- df_raw |>
+  mutate(across(all_of(community_columns),~replace_na(.x,0)))
+  community_matrix_raw <- as.matrix(df_raw[,community_columns,drop = FALSE])
+  storage.mode(community_matrix_raw) <- "numeric"
+  if (any(!is.finite(community_matrix_raw))) {
+  stop(paste("Non-finite species values remained in",csv_path))
+  }
+  if (any(community_matrix_raw < 0)) {
+  stop(paste("Negative species values detected in",csv_path))
+  }
+  ## ----------------------------------------------------------
+  ## Temporal binning
+  ##
+  ## The maximum value per species is retained within every
+  ## five-minute bin.
+  ## ----------------------------------------------------------
+  interval_string <- paste(bin_min,"min")
+  mb_observed <- df_raw |>
+  mutate(bin = floor_date(datetime,unit = interval_string)
+  ) |>
+  group_by(bin) |>
+  summarise(across(all_of(community_columns),~max(.x,na.rm = TRUE)),.groups = "drop"
+  ) |>
+  arrange(bin)
+  if (nrow(mb_observed) == 0L) {
+  stop(paste("No temporal bins were generated for",csv_path))
+  }
+  if (anyDuplicated(mb_observed$bin)) {
+  stop(paste("Duplicated temporal bins remained in",csv_path))
+  }
+  ## ----------------------------------------------------------
+  ## Describe the complete temporal range
+  ## ----------------------------------------------------------
+  parsed_years <- sort(unique(lubridate::year(mb_observed$bin)))
+  if (any(is.na(parsed_years))) {
+  stop(paste("Missing years remained after datetime parsing in",csv_path))
+  }
+  first_observed_bin <- min(mb_observed$bin)
+  last_observed_bin <- max(mb_observed$bin)
+  total_span_days <- as.numeric(difftime(last_observed_bin,first_observed_bin,units = "days"))
+  if (!is.finite(total_span_days)) {
+  stop(paste("Non-finite temporal span detected in",csv_path))
+  }
+  cat("Parsed years:",paste(parsed_years,collapse = ", "),"\n","First observed bin:",format(first_observed_bin,"%Y-%m-%d %H:%M:%S"),"\n",
+  "Last observed bin:",format(last_observed_bin,"%Y-%m-%d %H:%M:%S"),"\n","Total temporal span:",round(total_span_days,2),"days\n")
+  ## ----------------------------------------------------------
+  ## Identify monitoring sessions
+  ##
+  ## A gap longer than maximum_gap_days starts a new session.
+  ## ----------------------------------------------------------
+  gap_threshold_minutes <- (maximum_gap_days * 24 * 60)
+  mb_observed <- mb_observed |>
+  mutate(gap_minutes = as.numeric(difftime(bin,lag(bin),units = "mins")),new_session = is.na(gap_minutes) |
+  gap_minutes > gap_threshold_minutes,session = cumsum(new_session))
+  number_of_sessions <- n_distinct(mb_observed$session)
+  temporal_gaps <- mb_observed |>
+  filter(!is.na(gap_minutes),gap_minutes > gap_threshold_minutes
+  ) |>
+  transmute(session,previous_bin = lag(mb_observed$bin)[which(!is.na(mb_observed$gap_minutes) & mb_observed$gap_minutes >
+  gap_threshold_minutes)],next_bin = bin,gap_minutes,gap_days = gap_minutes / 1440)
+  cat("Maximum gap defining a new session:",maximum_gap_days,"days\n","Number of monitoring sessions:",number_of_sessions,"\n")
+  if (nrow(temporal_gaps) > 0L) {
+  cat("\nTemporal gaps defining new sessions:\n")
+  base::print.data.frame(as.data.frame(temporal_gaps),row.names = FALSE,na.print = "NA")
+  }
+  ## ----------------------------------------------------------
+  ## Remove temporary gap variables
+  ## ----------------------------------------------------------
+  mb_observed <- mb_observed |>
+  select(bin,session,all_of(community_columns))
+  ## ----------------------------------------------------------
+  ## Complete bins separately within every session
+  ##
+  ## Long gaps between sessions are not filled with zeros.
+  ## ----------------------------------------------------------
+  mb <- mb_observed |>
+  group_split(session) |>
+  map_dfr(
+  function(session_data) {
+  session_id <- unique(session_data$session)
+  if (length(session_id) != 1L) {
+  stop(paste("Invalid session identifier in",csv_path))
+  }
+  session_sequence <- seq(from = min(session_data$bin),to = max(session_data$bin),by = interval_string)
+  tibble(bin = session_sequence,session = session_id
+  ) |>
+  left_join(session_data,by = c("bin","session")
+  ) |>
+  mutate(across(all_of(community_columns),~replace_na(.x,0)))
+  }
+  ) |>
+  mutate(date = as.Date(bin,tz = tz_local),hour = hour(bin),minute = minute(bin),site = site_id
+  ) |>
+  arrange(session,bin)
+  if (nrow(mb) == 0L) {
+  stop(paste("No completed temporal bins were generated for",csv_path))
+  }
+  ## ----------------------------------------------------------
+  ## Session diagnostic
+  ## ----------------------------------------------------------
+  session_diagnostic_current <- mb |>
+  group_by(session) |>
+  summarise(first_bin = min(bin),last_bin = max(bin),complete_bins = n(),calendar_days = n_distinct(date),duration_days = as.numeric(difftime(
+  last_bin,first_bin,units = "days")),.groups = "drop"
+  ) |>
+  mutate(site = site_id,file = basename(csv_path)
+  ) |>
+  select(site,file,session,first_bin,last_bin,duration_days,complete_bins,calendar_days)
+  total_monitoring_days <- sum(session_diagnostic_current$duration_days)
+  cat("\nSession diagnostic:\n")
+  base::print.data.frame(as.data.frame(session_diagnostic_current),row.names = FALSE,na.print = "NA")
+  cat("\nTotal monitored duration across sessions:",round(total_monitoring_days,2),"days\n")
+  ## ----------------------------------------------------------
+  ## Final community checks
+  ## ----------------------------------------------------------
+  if (any(is.na(mb[,community_columns,drop = FALSE])
+  )) {
+  stop(paste("NA values remained after bin completion in",csv_path))
+  }
+  if (anyDuplicated(mb[,c("session","bin")]
+  )) {
+  stop(paste("Duplicated session-bin combinations detected in",csv_path))
+  }
+  ## ----------------------------------------------------------
+  ## Check temporal continuity within each session
+  ## ----------------------------------------------------------
+  continuity_check <- mb |>
+  group_by(session) |>
+  arrange(bin,.by_group = TRUE
+  ) |>
+  mutate(difference_minutes = as.numeric(difftime(bin,lag(bin),units = "mins"))
+  ) |>
+  ungroup() |>
+  filter(!is.na(difference_minutes),difference_minutes != bin_min)
+  if (nrow(continuity_check) > 0L) {
+  stop(paste("Non-consecutive bins remained within a session in",csv_path))
+  }
+  ## ----------------------------------------------------------
+  ## Processing diagnostic
+  ## ----------------------------------------------------------
+  processing_diagnostic_current <- tibble(site = site_id,file = basename(csv_path),total_source_rows = total_rows,
+  valid_source_rows = valid_source_rows,missing_datetime_inputs = missing_datetime_inputs,failed_datetimes = failed_datetimes,
+  failed_datetime_fraction = failed_datetime_fraction,observed_bins = nrow(mb_observed),complete_bins = nrow(mb),
+  number_of_sessions = number_of_sessions,first_observed_bin = first_observed_bin,last_observed_bin = last_observed_bin,parsed_years = paste(
+  parsed_years,collapse = ", "),total_span_days = total_span_days,monitored_duration_days = total_monitoring_days,
+  calendar_days = n_distinct(mb$date))
+  cat("\nProcessing result:\n","Site:",site_id,"\n","Valid source rows:",valid_source_rows,"\n","Observed bins:",nrow(mb_observed),"\n",
+  "Complete bins across sessions:",nrow(mb),"\n","Monitoring sessions:",number_of_sessions,"\n",
+  "Calendar days represented:",n_distinct(mb$date),"\n")
+  ## ----------------------------------------------------------
+  ## Store diagnostics as attributes
+  ## ----------------------------------------------------------
+  attr(mb,"datetime_parser_summary") <- parser_summary_current
+  attr(mb,"datetime_failed_examples"
+  ) <- if (failed_datetimes > 0L) {
+  failed_datetime_rows |>
+  count(datetime_original,datetime_clean,sort = TRUE,name = "number_of_rows"
+  ) |>
+  mutate(site = site_id,file = basename(csv_path)
+  ) |>
+  select(site,file,datetime_original,datetime_clean,number_of_rows)
+  } else {
+  tibble(site = character(),file = character(),datetime_original = character(),datetime_clean = character(),number_of_rows = integer())
+  }
+  attr(mb,"datetime_diagnostic") <- tibble(site = site_id,file = basename(csv_path),total_rows = total_rows,non_missing_datetime_inputs =
+  non_missing_datetime_inputs,missing_datetime_inputs = missing_datetime_inputs,parsed_datetimes = parsed_datetimes,failed_datetimes =
+  failed_datetimes,failed_fraction = failed_datetime_fraction,parsed_years = paste(parsed_years,collapse = ", "),total_span_days =
+  total_span_days,number_of_sessions = number_of_sessions,monitored_duration_days = total_monitoring_days)
+  attr(mb,"processing_diagnostic") <- processing_diagnostic_current
+  attr(mb,"session_diagnostic") <- session_diagnostic_current
+  attr(mb,"temporal_gaps") <- temporal_gaps
+  return(mb)
+}
+
+## ============================================================
+## PROCESS ALL ELIGIBLE SUMMARY FILES
+## ============================================================
+maximum_gap_days <- 7
+mb_list <- pmap(list(csv_path = site_metadata$file_path,site_id = site_metadata$site),
+function(csv_path,site_id) {
+process_summary(csv_path = csv_path,site_id = site_id,community_columns = community)
+}
+)
+names(mb_list) <- site_metadata$site
+
+## ============================================================
+## PROCESSING SUMMARY
+## ============================================================
+processing_check <- tibble(site = names(mb_list),total_bins = map_int(mb_list,nrow),observed_bins = map_int(mb_list,
+~if (nrow(.x) > 0L) {
+sum(rowSums(.x[,community,drop = FALSE]) > 0) } else { 0L
+}
+),calendar_days = map_int(mb_list,
+~if (nrow(.x) > 0L) {
+n_distinct(.x$date) } else { 0L
+}
+),first_bin = map_chr(mb_list,
+~if (nrow(.x) > 0L) {
+format(min(.x$bin),"%Y-%m-%d %H:%M:%S") } else { NA_character_
+}
+),last_bin = map_chr(mb_list,
+~if (nrow(.x) > 0L) {
+format(max(.x$bin),"%Y-%m-%d %H:%M:%S") } else { NA_character_
+}
+)
+) |>
+left_join(
+site_metadata |>
+select(site,environment,lynx),by = "site")
+cat("\nProcessing summary:\n")
+print(processing_check,n = Inf)
+if (any(processing_check$total_bins == 0L)) {
+stop(paste("Files without processed data:",paste(processing_check$site[processing_check$total_bins == 0L],collapse = ", ")))
+}
+
+## ============================================================
+## VERIFY PROCESSED SPECIES COLUMNS
+## ============================================================
+species_column_check <- map(mb_list,~setdiff(community,names(.x)))
+if (any(map_lgl(species_column_check,~length(.x) > 0L)
+)) {
+stop("At least one processed file is missing species columns")
+}
+
+## ============================================================
+## COMBINE ALL FILES
+## ============================================================
+mb_all <- bind_rows(mb_list
+) |>
+arrange(site,bin)
+stopifnot(!any(is.na(mb_all[,community,drop = FALSE])),all(mb_all$site %in% site_metadata$site))
+
+## ============================================================
+## CHECK BIN SPACING WITHIN EACH SITE
+## ============================================================
+bin_check <- mb_all |>
+group_by(site,session
+) |>
+arrange(bin,.by_group = TRUE
+) |>
+mutate(difference_minutes = as.numeric(difftime(bin,lag(bin),units = "mins"))
+) |>
+ungroup() |>
+filter(!is.na(difference_minutes),difference_minutes != bin_min)
+if (nrow(bin_check) > 0L) {
+stop("Non-consecutive bins detected within at least one site-session")
+}
+
+## ============================================================
+## PRESENCE-ABSENCE MATRIX
+## ============================================================
+Y_count <- as.matrix(mb_all[,community])
+storage.mode(Y_count) <- "numeric"
+Y_pa <- 1L * (Y_count > 0)
+colnames(Y_pa) <- species_raw
+stopifnot(all(Y_pa %in% c(0L,1L)))
+
+## ============================================================
+## ARRIVAL EVENTS
+##
+## An arrival is defined as an absence-to-presence transition
+## between two consecutive five-minute bins within the same
+## file/site.
+##
+## Transitions across midnight are retained.
+##
+## The first bin of each site is not counted because its
+## preceding state is unknown.
+## ============================================================
+arrival <- matrix(0L,nrow = nrow(Y_pa),ncol = ncol(Y_pa),dimnames = list(NULL,species_raw))
+site_session_id <- interaction(mb_all$site,mb_all$session,drop = TRUE,lex.order = TRUE)
+site_indices <- split(seq_len(nrow(mb_all)),site_session_id)
+for (idx in site_indices) {
+if (length(idx) < 2L) {
+next
+}
+previous_idx <- idx[-length(idx)]
+current_idx <- idx[-1L]
+time_difference <- as.numeric(difftime(mb_all$bin[current_idx],mb_all$bin[previous_idx],units = "mins"))
+consecutive <- (time_difference == bin_min)
+previous_state <- Y_pa[previous_idx,,drop = FALSE]
+current_state <- Y_pa[current_idx,,drop = FALSE]
+arrival[current_idx,] <- 1L * (current_state == 1L & previous_state == 0L & consecutive)
+}
+stopifnot(all(arrival %in% c(0L,1L)))
+
+## ============================================================
+## ARRIVAL COUNTS BY SITE
+## ============================================================
+arrival_by_site <- rowsum(arrival,group = mb_all$site,reorder = FALSE)
+colnames(arrival_by_site) <- species_raw
+arrival_by_site <- arrival_by_site[site_metadata$site,,drop = FALSE]
+stopifnot(identical(rownames(arrival_by_site),site_metadata$site),all(colSums(arrival_by_site) == colSums(arrival)))
+cat("\nArrival counts by site:\n")
+print(arrival_by_site)
+
+## ============================================================
+## ARRIVAL TOTALS BY SPECIES
+## ============================================================
+arrival_totals <- tibble(species = species_raw,arrivals = as.integer(colSums(arrival_by_site)))
+cat("\nArrival totals by species:\n")
+print(arrival_totals,n = Inf)
+
+
+## ============================================================
+## REMOVE SPECIES WITHOUT ARRIVALS
+## ============================================================
+keep_species <- colSums(arrival_by_site) > 0L
+removed_species <- species_raw[!keep_species]
+if (length(removed_species) > 0L) {
+message(paste("Species removed because no arrivals were detected:",paste(removed_species,collapse = ", ")))
+}
+arrival_community <- arrival_by_site[,keep_species,drop = FALSE]
+if (ncol(arrival_community) < 2L) {
+stop("Fewer than two species with arrivals remained")
+}
+
+## ============================================================
+## REMOVE EMPTY SITES
+## ============================================================
+empty_sites <- rowSums(arrival_community) == 0L
+if (any(empty_sites)) {
+warning(paste("Sites removed because no arrivals were detected:",paste(rownames(arrival_community)[empty_sites],collapse = ", ")))
+arrival_community <- arrival_community[!empty_sites,,drop = FALSE]
+}
+if (nrow(arrival_community) < 5L) {
+stop("Fewer than five non-empty sites remained")
+}
+
+## ============================================================
+## ALIGN METADATA
+## ============================================================
+site_metadata_analysis <- site_metadata |>
+filter(site %in% rownames(arrival_community)
+) |>
+slice(match(rownames(arrival_community),site)
+) |>
+droplevels()
+stopifnot(identical(site_metadata_analysis$site,rownames(arrival_community)))
+
+## ============================================================
+## FINAL DESIGN TABLE
+## ============================================================
+analysis_design <- site_metadata_analysis |>
+count(environment,lynx,name = "number_of_sites",.drop = FALSE)
+cat("\nFinal analysis design:\n")
+print(analysis_design)
+if (any(analysis_design$number_of_sites == 0L)) {
+stop(paste("At least one treatment combination became empty","after removing sites without arrivals"))
+}
+
+## ============================================================
+## SITE DIAGNOSTIC
+## ============================================================
+site_diagnostic <- site_metadata_analysis |>
+mutate(total_arrivals = as.integer(rowSums(arrival_community)),arrival_richness = as.integer(rowSums(arrival_community > 0)),
+total_bins = processing_check$total_bins[match(site,processing_check$site)],arrivals_per_1000_bins = 1000 * total_arrivals / total_bins)
+cat("\nSite diagnostic:\n")
+print(site_diagnostic,n = Inf)
+
+## ============================================================
+## RELATIVE ARRIVAL COMPOSITION
+##
+## Every row sums to one.
+##
+## Consequently, the ordination and PERMANOVA represent
+## differences in relative composition, not total intensity.
+## ============================================================
+arrival_relative <- decostand(arrival_community,method = "total")
+stopifnot(all(abs(rowSums(arrival_relative) - 1) < 1e-10))
+cat("\nRelative arrival composition:\n")
+print(round(arrival_relative,3))
+
+## ============================================================
+## BRAY-CURTIS DISSIMILARITY
+## ============================================================
+bray_distance <- vegdist(arrival_relative,method = "bray")
+bray_matrix <- as.matrix(bray_distance)
+stopifnot(isTRUE(all.equal(bray_matrix,t(bray_matrix))),all(diag(bray_matrix) == 0),all(bray_matrix >= 0),all(bray_matrix <= 1))
+
+## ============================================================
+## PCoA WITH LINGOES CORRECTION
+## ============================================================
+pcoa_arrival <- wcmdscale(bray_distance,k = 2,eig = TRUE,add = "lingoes")
+pcoa_sites <- as.data.frame(pcoa_arrival$points)
+colnames(pcoa_sites)[1:2] <- c("PCoA1","PCoA2")
+pcoa_sites$site <- rownames(pcoa_sites)
+positive_eigenvalues <- pcoa_arrival$eig[pcoa_arrival$eig > 0]
+explained_variance <- 100 *
+positive_eigenvalues /
+sum(positive_eigenvalues)
+pcoa_sites <- pcoa_sites |>
+left_join(site_metadata_analysis,by = "site")
+cat("\nPCoA1 explained variation:",round(explained_variance[1],2),"%\n")
+cat("PCoA2 explained variation:",round(explained_variance[2],2),"%\n")
+cat("Cumulative variation:",round(sum(explained_variance[1:2]),2),"%\n")
+
+## ============================================================
+## PCoA PLOT
+## ============================================================
+pcoa_plot <- ggplot(pcoa_sites,aes(x = PCoA1,y = PCoA2,colour = lynx,shape = environment)
+) +
+geom_point(size = 4
+) +
+geom_text(aes(label = site),vjust = -0.8,size = 3,show.legend = FALSE
+) +
+coord_equal() +
+labs(title = "PCoA of full-day carrion arrival composition",subtitle = paste0("Bray-Curtis with Lingoes correction; axes represent ",round(sum(
+explained_variance[1:2]),1),"%"),x = paste0("PCoA1 (",round(explained_variance[1],1),"%)"),y = paste0("PCoA2 (",round(
+explained_variance[2],1),"%)"),colour = "Lynx",shape = "Environment"
+) +
+theme_classic()
+print(pcoa_plot)
+
+## ============================================================
+## PCoA FACETED BY ENVIRONMENT
+## ============================================================
+pcoa_facet_plot <- ggplot(pcoa_sites,aes(x = PCoA1,y = PCoA2,colour = lynx,shape = lynx)
+) +
+geom_point(size = 4
+) +
+geom_text(aes(label = site),vjust = -0.8,size = 3,show.legend = FALSE
+) +
+facet_wrap(~environment
+) +
+coord_equal() +
+labs(title = "PCoA by environment",subtitle = "Full-day relative arrival composition",x = paste0("PCoA1 (",round(explained_variance[1],1),
+"%)"),y = paste0("PCoA2 (",round(explained_variance[2],1),"%)"),colour = "Lynx",shape = "Lynx"
+) +
+theme_classic()
+print(pcoa_facet_plot)
+
+## ============================================================
+## NMDS
+## ============================================================
+set.seed(123)
+nmds_arrival <- metaMDS(arrival_relative,distance = "bray",k = 2,trymax = 1000,autotransform = FALSE,noshare = FALSE,trace = FALSE)
+nmds_repeated_solution <- (nmds_arrival$converged > 0L)
+cat("\nNMDS stress:",nmds_arrival$stress,"\n")
+cat("Repeated NMDS solution:",nmds_repeated_solution,"\n")
+nmds_sites <- as.data.frame(scores(nmds_arrival,display = "sites"))
+nmds_sites$site <- rownames(nmds_sites)
+nmds_sites <- nmds_sites |>
+left_join(site_metadata_analysis,by = "site")
+nmds_plot <- ggplot(nmds_sites,aes(x = NMDS1,y = NMDS2,colour = lynx,shape = environment)
+) +
+geom_point(size = 4
+) +
+geom_text(aes(label = site),vjust = -0.8,size = 3,show.legend = FALSE
+) +
+coord_equal() +
+labs(title = "NMDS of full-day carrion arrival composition",subtitle = paste0("Stress = ",signif(nmds_arrival$stress,3),
+"; repeated solution = ",nmds_repeated_solution),x = "NMDS1",y = "NMDS2",colour = "Lynx",shape = "Environment"
+) +
+theme_classic()
+print(nmds_plot)
+stressplot(nmds_arrival,main = "NMDS Shepard plot")
+
+## ============================================================
+## FACTORIAL PERMANOVA
+##
+## The full model tests:
+## 1. Environment
+## 2. Lynx
+## 3. Environment-by-lynx interaction
+##
+## Each eligible summary file is an experimental unit.
+## ============================================================
+set.seed(123)
+permanova_overall <- adonis2(bray_distance ~ environment * lynx,data = site_metadata_analysis,permutations = n_permutations)
+cat("\nOverall factorial PERMANOVA:\n")
+print(permanova_overall)
+
+## ============================================================
+## SEQUENTIAL TERM TESTS
+##
+## These results can depend on term order in an unbalanced
+## design.
+## ============================================================
+set.seed(123)
+permanova_terms_environment_first <- adonis2(bray_distance ~ environment * lynx,data = site_metadata_analysis,permutations = n_permutations,
+by = "terms")
+set.seed(123)
+permanova_terms_lynx_first <- adonis2(bray_distance ~ lynx * environment,data = site_metadata_analysis,permutations = n_permutations,by = "terms"
+)
+cat("\nSequential PERMANOVA, environment entered first:\n")
+print(permanova_terms_environment_first)
+cat("\nSequential PERMANOVA, lynx entered first:\n")
+print(permanova_terms_lynx_first)
+
+## ============================================================
+## INTERACTION TEST
+##
+## This is the first biological question in the factorial model:
+## does the association with lynx depend on the environment?
+## ============================================================
+set.seed(123)
+permanova_interaction <- adonis2(bray_distance ~ environment * lynx,data = site_metadata_analysis,permutations = n_permutations,by = "margin")
+cat("\nMarginal factorial PERMANOVA:\n")
+print(permanova_interaction)
+
+## ============================================================
+## ADDITIVE MODEL
+##
+## This model is useful if the interaction is not supported.
+## It estimates environment and lynx effects without their
+## interaction.
+## ============================================================
+set.seed(123)
+permanova_additive <- adonis2(bray_distance ~ environment + lynx,data = site_metadata_analysis,permutations = n_permutations,by = "margin")
+cat("\nAdditive marginal PERMANOVA:\n")
+print(permanova_additive)
+
+## ============================================================
+## MULTIVARIATE DISPERSION FOR FOUR TREATMENT COMBINATIONS
+## ============================================================
+treatment <- interaction(site_metadata_analysis$environment,site_metadata_analysis$lynx,drop = TRUE,sep = "_")
+dispersion_treatment <- betadisper(bray_distance,group = treatment,type = "median",bias.adjust = TRUE,sqrt.dist = TRUE)
+set.seed(123)
+dispersion_treatment_test <- permutest(dispersion_treatment,permutations = n_permutations)
+cat("\nDispersion across the four treatment combinations:\n")
+print(dispersion_treatment_test)
+
+## ============================================================
+## DISPERSION BY ENVIRONMENT
+## ============================================================
+dispersion_environment <- betadisper(bray_distance,group = site_metadata_analysis$environment,type = "median",bias.adjust = TRUE,sqrt.dist = TRUE
+)
+set.seed(123)
+dispersion_environment_test <- permutest(dispersion_environment,permutations = n_permutations)
+cat("\nDispersion by environment:\n")
+print(dispersion_environment_test)
+
+## ============================================================
+## DISPERSION BY LYNX
+## ============================================================
+dispersion_lynx <- betadisper(bray_distance,group = site_metadata_analysis$lynx,type = "median",bias.adjust = TRUE,sqrt.dist = TRUE)
+set.seed(123)
+dispersion_lynx_test <- permutest(dispersion_lynx,permutations = n_permutations)
+cat("\nDispersion by lynx presence:\n")
+print(dispersion_lynx_test)
+
+## ============================================================
+## DISPERSION PLOTS
+## ============================================================
+plot(dispersion_treatment,main = "Multivariate dispersion by treatment",xlab = "PCoA1",ylab = "PCoA2")
+boxplot(dispersion_treatment,main = "Distance to treatment-group median",xlab = "Treatment",ylab = "Distance to group median")
+
+## ============================================================
+## DOMINANT SPECIES BY SITE
+## ============================================================
+dominant_species <- apply(arrival_relative,1,
+function(x) {
+names(which.max(x))
+}
+)
+dominant_proportion <- apply(arrival_relative,1,max)
+top_species <- apply(arrival_relative,1,
+function(x) {
+positive_values <- sort(x[x > 0],decreasing = TRUE)
+if (length(positive_values) == 0L) {
+return(NA_character_)
+}
+number_to_show <- min(3L,length(positive_values))
+paste(names(positive_values)[seq_len(number_to_show)],round(positive_values[seq_len(number_to_show)],3),sep = "=",collapse = ", ")
+}
+)
+composition_diagnostic <- site_diagnostic |>
+mutate(dominant_species = dominant_species[site],dominant_proportion = dominant_proportion[site],top_species = top_species[site])
+cat("\nComposition diagnostic by site:\n")
+print(composition_diagnostic,n = Inf)
+
+## ============================================================
+## MEAN RELATIVE COMPOSITION BY TREATMENT
+##
+## Every site has equal weight in this summary.
+## ============================================================
+arrival_relative_table <- as.data.frame(arrival_relative
+) |>
+rownames_to_column("site") |>
+left_join(site_metadata_analysis,by = "site")
+group_composition <- arrival_relative_table |>
+group_by(environment,lynx
+) |>
+summarise(across(all_of(colnames(arrival_relative)),mean),.groups = "drop")
+cat("\nMean relative composition by treatment:\n")
+print(group_composition,n = Inf,width = Inf)
+
+## ============================================================
+## FINAL SUMMARY
+## ============================================================
+cat("\n================ ANALYSIS SUMMARY ================\n")
+cat("Filename selection rule: basename begins exactly with 'summary'\n")
+cat("Analysis period: full 24-hour cycle\n")
+cat("Temporal bin:",bin_min,"minutes\n")
+cat("Eligible summary files:",length(csv_files),"\n")
+cat("Analysed non-empty sites:",nrow(arrival_community),"\n")
+cat("Species retained:",ncol(arrival_community),"\n")
+cat("Total arrivals:",sum(arrival_community),"\n")
+cat("PCoA variation represented by axes 1 and 2:",round(sum(explained_variance[1:2]),2),"%\n")
+cat("NMDS stress:",nmds_arrival$stress,"\n")
+cat("NMDS repeated solution:",nmds_repeated_solution,"\n")
+cat("\nFinal factorial design:\n")
+print(analysis_design)
+################################################################################
+library(ggrepel)
+## ============================================================
+## ENGLISH SPECIES NAMES
+## ============================================================
+species_english <- c(N = "Black vulture",L = "Griffon vulture",A = "Marsh harrier",I = "Spanish imperial eagle",U = "Magpie",C = "Raven",
+Z = "Red fox",M = "Egyptian mongoose",J = "Wild boar",G = "Iberian lynx",K = "Red kite",O = "Northern goshawk",R = "Small mammals",
+T = "Others")
+missing_species_names <- setdiff(colnames(arrival_relative),names(species_english))
+if (length(missing_species_names) > 0L) {
+stop(paste("Missing English names for:",paste(missing_species_names,collapse = ", ")))
+}
+## ============================================================
+## NUMERIC SITE LABELS
+## ============================================================
+site_key <- site_metadata_analysis |>
+mutate(site_number = row_number(),site_label = as.character(site_number)
+) |>
+select(site_number,site_label,site,file,environment,lynx)
+cat("\nSite-number key:\n")
+base::print.data.frame(as.data.frame(site_key),row.names = FALSE,na.print = "NA")
+pcoa_sites_numbered <- pcoa_sites |>
+left_join(
+site_key |>
+select(site,site_number,site_label),by = "site")
+stopifnot(nrow(pcoa_sites_numbered) == nrow(site_metadata_analysis),!any(is.na(pcoa_sites_numbered$site_number)),!anyDuplicated(
+pcoa_sites_numbered$site_number))
+## ============================================================
+## PREPARE PCoA AXES FOR ENVFIT
+## ============================================================
+pcoa_axes_for_envfit <- pcoa_arrival$points[,1:2,drop = FALSE]
+colnames(pcoa_axes_for_envfit) <- c("PCoA1","PCoA2")
+stopifnot(nrow(pcoa_axes_for_envfit) == nrow(arrival_relative),identical(rownames(pcoa_axes_for_envfit),rownames(arrival_relative)))
+## ============================================================
+## FIT SPECIES VECTORS TO THE PCoA
+## ============================================================
+set.seed(123)
+species_fit <- envfit(pcoa_axes_for_envfit,arrival_relative,permutations = n_permutations)
+## ============================================================
+## EXTRACT SPECIES VECTORS
+## ============================================================
+species_vector_scores <- as.data.frame(scores(species_fit,display = "vectors"))
+if (ncol(species_vector_scores) < 2L) {
+stop("Fewer than two species-vector axes were returned by envfit")
+}
+names(species_vector_scores)[1:2] <- c("PCoA1","PCoA2")
+species_codes <- rownames(species_vector_scores)
+if (is.null(species_codes)) {
+stop("Species-vector scores do not contain species names")
+}
+species_vectors <- species_vector_scores |>
+rownames_to_column("species_code"
+) |>
+mutate(species = unname(species_english[species_code]),p_value = unname(species_fit$vectors$pvals[species_code]),r_squared = unname(
+species_fit$vectors$r[species_code])
+) |>
+select(species_code,species,PCoA1,PCoA2,r_squared,p_value)
+## ============================================================
+## VALIDATE SPECIES-VECTOR TABLE
+## ============================================================
+if (any(is.na(species_vectors$species))) {
+stop(paste("Missing English names for:",paste(species_vectors$species_code[is.na(species_vectors$species)],collapse = ", ")))
+}
+if (any(is.na(species_vectors$p_value))) {
+stop(paste("Missing p-values for:",paste(species_vectors$species_code[is.na(species_vectors$p_value)],collapse = ", ")))
+}
+if (any(is.na(species_vectors$r_squared))) {
+stop(paste("Missing goodness-of-fit values for:",paste(species_vectors$species_code[is.na(species_vectors$r_squared)],collapse = ", ")))
+}
+if (any(!is.finite(as.matrix(species_vectors[,c("PCoA1","PCoA2")]))
+)) {
+stop("Non-finite species-vector coordinates were returned by envfit")
+}
+## ============================================================
+## RETAIN STATISTICALLY SUPPORTED VECTORS
+## ============================================================
+species_vectors_significant <- species_vectors |>
+filter(p_value <= 0.05
+) |>
+arrange(p_value)
+cat("\nSpecies fitted to the PCoA:\n")
+base::print.data.frame(as.data.frame(
+species_vectors |>
+arrange(p_value)),row.names = FALSE,na.print = "NA",digits = 4)
+cat("\nSpecies vectors retained in the plot:\n")
+if (nrow(species_vectors_significant) > 0L) {
+base::print.data.frame(as.data.frame(species_vectors_significant),row.names = FALSE,na.print = "NA",digits = 4)
+} else {
+cat("None\n")
+}
+## ============================================================
+## CREATE BASE PCoA PLOT
+## ============================================================
+pcoa_species_plot <- ggplot(pcoa_sites_numbered,aes(x = PCoA1,y = PCoA2,colour = lynx,shape = environment)
+) +
+geom_hline(yintercept = 0,linewidth = 0.3,colour = "grey82"
+) +
+geom_vline(xintercept = 0,linewidth = 0.3,colour = "grey82"
+) +
+geom_point(size = 4
+) +
+ggrepel::geom_text_repel(aes(label = site_label),size = 3.8,box.padding = 0.30,point.padding = 0.15,segment.colour = NA,max.overlaps = Inf,
+force = 1.5,seed = 123,show.legend = FALSE
+) +
+coord_equal(clip = "off"
+) +
+scale_x_continuous(expand = expansion(mult = c(0.14,0.20))
+) +
+scale_y_continuous(expand = expansion(mult = c(0.14,0.20))
+) +
+labs(title = "PCoA of relative arrival composition",x = paste0("PCoA1 (",round(explained_variance[1],1),"%)"),y = paste0("PCoA2 (",
+round(explained_variance[2],1),"%)"),colour = "Lynx",shape = "Environment"
+) +
+theme_classic() +
+theme(plot.margin = margin(t = 10,r = 40,b = 10,l = 20))
+## ============================================================
+## ADD SIGNIFICANT SPECIES VECTORS
+## ============================================================
+if (nrow(species_vectors_significant) > 0L) {
+  ## Calculate a common graphical multiplier
+site_x_range <- diff(range(pcoa_sites_numbered$PCoA1,na.rm = TRUE))
+site_y_range <- diff(range(pcoa_sites_numbered$PCoA2,na.rm = TRUE))
+vector_x_max <- max(abs(species_vectors_significant$PCoA1),na.rm = TRUE)
+vector_y_max <- max(abs(species_vectors_significant$PCoA2),na.rm = TRUE)
+vector_scale_candidates <- c(if (is.finite(site_x_range) && site_x_range > 0 && is.finite(vector_x_max) && vector_x_max > 0
+) {
+0.36 * site_x_range / vector_x_max } else { Inf
+},
+if (is.finite(site_y_range) && site_y_range > 0 && is.finite(vector_y_max) && vector_y_max > 0
+) {
+0.36 * site_y_range / vector_y_max } else { Inf
+}
+)
+vector_multiplier <- min(vector_scale_candidates)
+if (!is.finite(vector_multiplier) || vector_multiplier <= 0
+) {
+vector_multiplier <- 1
+}
+  ## Keep statistical and graphical coordinates separate
+species_vectors_plot <-
+species_vectors_significant |>
+mutate(arrow_x = PCoA1 * vector_multiplier,arrow_y = PCoA2 * vector_multiplier,label_x = arrow_x * 1.12,label_y = arrow_y * 1.12)
+  ## Add arrows and repelled species labels
+pcoa_species_plot <-
+pcoa_species_plot +
+geom_segment(data = species_vectors_plot,aes(x = 0,y = 0,xend = arrow_x,yend = arrow_y),inherit.aes = FALSE,arrow = grid::arrow(
+length = grid::unit(0.16,"cm"),type = "closed"),linewidth = 0.55,colour = "black"
+) +
+ggrepel::geom_text_repel(data = species_vectors_plot,aes(x = label_x,y = label_y,label = species),inherit.aes = FALSE,colour = "black",
+size = 3.4,box.padding = 0.50,point.padding = 0.10,segment.colour = NA,max.overlaps = Inf,force = 4,force_pull = 0.4,seed = 456,
+direction = "both"
+) +
+labs(subtitle = paste0("Species vectors with permutation p ","\u2264 0.05"))
+} else {
+pcoa_species_plot <-
+pcoa_species_plot +
+labs(subtitle = paste0("No species vector had permutation p ","\u2264 0.05"))
+}
+print(pcoa_species_plot)
+## ============================================================
+## RELATIVE ARRIVAL COMPOSITION BY SITE
+## ============================================================
+arrival_relative_long <- as.data.frame(arrival_relative
+) |>
+rownames_to_column("site") |>
+pivot_longer(cols = all_of(colnames(arrival_relative)),names_to = "species",values_to = "relative_arrival"
+) |>
+left_join(
+site_metadata_analysis |>
+select(site,environment,lynx),by = "site"
+) |>
+mutate(species = factor(species,levels = colnames(arrival_relative)),site = factor(site,levels = site_metadata_analysis$site))
+arrival_composition_site_plot <- ggplot(arrival_relative_long,aes(x = site,y = relative_arrival,fill = species)
+) +
+geom_col(width = 0.85
+) +
+facet_grid(environment ~ lynx,scales = "free_x",space = "free_x"
+) +
+scale_y_continuous(labels = scales::percent_format(accuracy = 1),expand = expansion(mult = c(0,0.02))
+) +
+labs(title = "Relative arrival composition by site",x = NULL,y = "Relative arrival composition",fill = "Species"
+) +
+theme_classic() +
+theme(axis.text.x = element_text(angle = 45,hjust = 1),panel.spacing.x = unit(1,"lines"))
+print(arrival_composition_site_plot)
